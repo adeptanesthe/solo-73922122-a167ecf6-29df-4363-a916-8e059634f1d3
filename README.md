@@ -19,10 +19,23 @@ subject to Σ|g_i| ≤ gain_limit
 ```
 
 这是凸优化问题（凸二次函数的最大值 + 凸约束），以 epigraph 形式用
-`scipy.optimize.minimize(method="SLSQP")` 求解（解析梯度）。直通解
-`[1,0,…,0]` 的 L1 范数为 1 ≤ gain_limit，因此约束集恒非空。返回前会对
-候选解重新精确核算：L1 超限则按比例缩回边界，各座位误差用全长卷积重算，
-并再次校验"不变差"与"最差误差严格下降"两个条件。
+`scipy.optimize.minimize(method="SLSQP")` 求解（解析梯度）。
+
+**L1 预算的精确建模。** 早期实现把 `Σ|g| ≤ gain_limit` 写成
+`gain_limit − |g|₁ ≥ 0`，并向 SLSQP 提供 `−sign(g)` 作为次梯度。这在
+`gain_limit = 1` 时必然失效：最优解正好落在 L1 球面的非光滑边界上，
+SLSQP 线搜索停滞，最终以 "Iteration limit reached" 报 `failed`，尽管
+附近已有可用解。现在改用拆分变量 `g = g₊ − g₋`（`g₊, g₋ ≥ 0`），预算
+约束变为**线性**的 `Σ(g₊ + g₋) ≤ gain_limit`，处处可微，13 次迭代即可
+收敛。
+
+**返回前的独立复核。** 求解器迭代出的候选系数先按预算缩放（若 SLSQP
+有微小越界），再用**全长卷积**逐座位重新计算误差；若某个活跃约束的
+误差比直通高出几个 ulp，会沿该座位的梯度做阻尼修正并重新投影到预算内。
+只有复核后同时满足"各座位误差 ≤ 直通"且"最差误差严格下降（相对阈值
+`1e-9·max(1, worst_before)`）"时才返回 `improved`，报告中所有前后误差
+都来自这同一次全长卷积复核。直通解 `[1,0,…,0]` 的 L1 范数为 1，因此
+`gain_limit ≥ 1` 时约束集恒非空。
 
 ## API
 
@@ -65,6 +78,25 @@ docker compose up --build
 # 服务监听 http://127.0.0.1:8000 ，文档在 http://127.0.0.1:8000/docs
 ```
 
+镜像和 Compose 都固定了 `OMP_NUM_THREADS=1` / `OPENBLAS_NUM_THREADS=1` /
+`MKL_NUM_THREADS=1`。SLSQP 每步只解很小的稠密系统，多线程 BLAS 在此
+规模下反而慢一个数量级（24 线程时约 0.7 s，单线程约 28 ms）。
+
+### 复现报告中的请求
+
+服务启动后直接执行（请求体已放在仓库中）：
+
+```bash
+curl -X POST http://127.0.0.1:8000/v1/eq/optimize \
+  -H 'Content-Type: application/json' \
+  -d @examples/request_reported.json
+```
+
+修复前该请求返回 `{"status":"failed", ... "optimizer did not converge:
+Iteration limit reached"}`；现在返回 `improved`，32 个系数满足
+`sum|g| ≤ 1`，两座位误差分别为 0.028237 → 0.019263 与 0.006671 → 0.006671
+（不高于直通），最差误差 0.028237 → 0.019263。
+
 ### 本地开发
 
 ```bash
@@ -76,10 +108,15 @@ uvicorn app.main:app --reload --port 8000
 ### 演示
 
 ```bash
-./examples/demo.sh                 # 依次演示 improved / no_improvement / 422
+./examples/demo.sh                 # 依次演示报告案例/改进/无改善/422
 curl -X POST http://127.0.0.1:8000/v1/eq/optimize \
   -H 'Content-Type: application/json' \
   -d @examples/request_improved.json
+
+# 报告中的紧预算案例（gain_limit = 1），修复后应返回 improved
+curl -X POST http://127.0.0.1:8000/v1/eq/optimize \
+  -H 'Content-Type: application/json' \
+  -d @examples/request_reported.json
 ```
 
 ### 测试
@@ -94,9 +131,9 @@ python -m pytest tests/ -v
 app/
   main.py      # FastAPI 应用、路由、422 异常处理
   schemas.py   # 请求/响应模型（Pydantic 校验）
-  solver.py    # 凸优化求解（SciPy SLSQP，epigraph 形式）
+  solver.py    # 凸优化求解（SciPy SLSQP，split-L1 epigraph + 全长卷积复核）
 tests/test_api.py
-examples/      # 可直接 POST 的示例请求与 demo 脚本
+examples/      # 可直接 POST 的示例请求（含报告案例）与 demo 脚本
 Dockerfile
 docker-compose.yml
 requirements.txt / requirements-dev.txt
@@ -107,7 +144,9 @@ requirements.txt / requirements-dev.txt
 - MSE 在全长卷积（`L + 31` 点）上取平均；目标为单位幅度延时脉冲。
 - "改善"判定阈值：`worst_after < worst_before − 1e-9·max(1, worst_before)`，
   避免把数值噪声当作改善。
+- "各座位不变差"按全长卷积复核结果判定；对直通误差本身已为 0 的座位，
+  允许 `1e-9·max(1, error_before)` 的浮点容差（任何 FIR 都无法使其更低）。
 - 若求解器未收敛但最终迭代点经核验可行且严格更优，仍会返回 `improved`
   （`solver_success=false` 并在 `detail` 中注明）；无法得到可信结果时返回 `failed`。
-- 单线程同步计算：问题规模很小（33 个变量），单次请求通常在几十毫秒内。
+- 单线程同步计算：问题规模很小（65 个变量），单次请求通常在几十毫秒内。
 - `sample_rate` 不参与计算，仅作元数据；如需按频率加权或限制相位，需要扩展模型。

@@ -5,6 +5,12 @@ services:
     container_name: theatre-eq-api
     ports:
       - "8000:8000"
+    environment:
+      # SLSQP works on tiny dense systems; a single BLAS thread avoids
+      # multi-threaded overhead (seconds instead of milliseconds here).
+      OMP_NUM_THREADS: "1"
+      OPENBLAS_NUM_THREADS: "1"
+      MKL_NUM_THREADS: "1"
     restart: unless-stopped
     healthcheck:
       test:

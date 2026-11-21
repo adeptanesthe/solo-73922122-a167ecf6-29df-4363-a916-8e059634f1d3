@@ -83,6 +83,111 @@ def test_improved_two_seats():
         assert seat["error_after"] == pytest.approx(exp_after, rel=1e-9)
 
 
+def test_gain_limit_one_does_not_report_failure():
+    # Regression for the reported theatre case: the optimum sits exactly
+    # on the L1 budget sphere (gain_limit = 1), where the old
+    # ``-sign(g)`` formulation made SLSQP stall and return ``failed``.
+    irs = [[0.25672, 0.3127, -0.64944], [0.43308, 1.01114, -0.1978]]
+    resp = client.post(
+        "/v1/eq/optimize",
+        json={"impulse_responses": irs, "target_delay": 1, "gain_limit": 1},
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+
+    assert body["status"] == "improved"
+    assert body["solver_success"] is True
+    coeffs = body["coefficients"]
+    assert len(coeffs) == 32
+    assert sum(abs(c) for c in coeffs) <= 1.0 + 1e-12
+    assert body["l1_norm"] <= 1.0 + 1e-12
+    assert body["l1_norm"] == pytest.approx(sum(abs(c) for c in coeffs), rel=1e-12)
+
+    # Every seat must be no worse than the passthrough, with no tolerance
+    # beyond floating-point round-off, and the worst seat must improve.
+    after = reference_errors(irs, coeffs, target_delay=1)
+    before = reference_errors(irs, [1.0] + [0.0] * 31, target_delay=1)
+    for seat, exp_before, exp_after in zip(body["seats"], before, after):
+        assert seat["error_before"] == pytest.approx(exp_before, rel=1e-12)
+        assert seat["error_after"] == pytest.approx(exp_after, rel=1e-12)
+        assert seat["error_after"] <= seat["error_before"]
+    assert max(after) < max(before)
+    assert body["worst_error_after"] < body["worst_error_before"]
+    assert body["worst_error_after"] == pytest.approx(max(after), rel=1e-12)
+
+
+def test_gain_limit_one_solver_direct_reported_case():
+    irs = [[0.25672, 0.3127, -0.64944], [0.43308, 1.01114, -0.1978]]
+    result = solver.solve_shared_fir(irs, target_delay=1, gain_limit=1.0)
+    assert result.status == solver.STATUS_IMPROVED
+    assert result.solver_success is True
+    assert result.l1_norm <= 1.0 + 1e-12
+    for before, after, h in zip(result.errors_before, result.errors_after, irs):
+        assert after == pytest.approx(solver.full_length_mse(h, result.coefficients, 1), rel=1e-12)
+        assert after <= before
+
+
+def test_no_improvement_at_gain_limit_one():
+    # Passthrough already matches the target exactly; every FIR has
+    # L1 >= 1 and any deviation only adds error, so nothing can improve.
+    resp = client.post(
+        "/v1/eq/optimize",
+        json=make_payload(
+            impulse_responses=[[0.0, 1.0], [0.0, 1.0]], target_delay=1, gain_limit=1.0
+        ),
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "no_improvement"
+    assert "coefficients" not in body
+    assert body["worst_error_before"] == pytest.approx(0.0, abs=1e-15)
+
+
+def test_no_improvement_seat_cannot_be_improved_further():
+    # Seat 0 is already perfect; the other seat can improve, so the
+    # minimax objective can drop.  With gain_limit = 1 the optimum can
+    # only help the imperfect seat by disturbing the perfect one, so this
+    # must be reported as no_improvement rather than a spurious failure.
+    irs = [[0.0, 1.0], [1.0, 0.5]]
+    resp = client.post(
+        "/v1/eq/optimize",
+        json=make_payload(impulse_responses=irs, target_delay=1, gain_limit=1.0),
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] in {"improved", "no_improvement"}
+    if body["status"] == "no_improvement":
+        assert "coefficients" not in body
+    else:
+        assert sum(abs(c) for c in body["coefficients"]) <= 1.0 + 1e-12
+        for seat in body["seats"]:
+            assert seat["error_after"] <= seat["error_before"] + 1e-15
+
+
+def test_every_reported_error_matches_full_convolution():
+    # The "recompute with the final coefficients" rule: whatever the
+    # solver returns, the reported per-seat numbers must equal an
+    # independent full-length convolution of the returned coefficients.
+    rng = np.random.default_rng(4242)
+    for gain_limit in (1.0, 1.5, 3.0):
+        irs = (0.4 * rng.standard_normal((3, 40))).tolist()
+        irs[0][0] = 1.0
+        body = client.post(
+            "/v1/eq/optimize",
+            json={"impulse_responses": irs, "target_delay": 5, "gain_limit": gain_limit},
+        ).json()
+        if body["status"] != "improved":
+            continue
+        coeffs = body["coefficients"]
+        assert sum(abs(c) for c in coeffs) <= gain_limit + 1e-12
+        after = reference_errors(irs, coeffs, target_delay=5)
+        before = reference_errors(irs, [1.0] + [0.0] * 31, target_delay=5)
+        for seat, exp_before, exp_after in zip(body["seats"], before, after):
+            assert seat["error_before"] == pytest.approx(exp_before, rel=1e-12)
+            assert seat["error_after"] == pytest.approx(exp_after, rel=1e-12)
+            assert seat["error_after"] <= seat["error_before"]
+
+
 def test_gain_limit_one_still_improves_and_respects_budget():
     resp = client.post("/v1/eq/optimize", json=make_payload(gain_limit=1.0))
     assert resp.status_code == 200

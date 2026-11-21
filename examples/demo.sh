@@ -14,6 +14,12 @@ echo "== GET /v1/eq/example (a ready-to-post demo payload) =="
 curl -sS "$BASE/v1/eq/example"
 echo; echo
 
+echo "== POST /v1/eq/optimize  (reported tight-budget case: gain_limit=1 -> improved) =="
+curl -sS -X POST "$BASE/v1/eq/optimize" \
+  -H 'Content-Type: application/json' \
+  -d @examples/request_reported.json
+echo; echo
+
 echo "== POST /v1/eq/optimize  (two seats, opposite reflections -> improved) =="
 curl -sS -X POST "$BASE/v1/eq/optimize" \
   -H 'Content-Type: application/json' \
